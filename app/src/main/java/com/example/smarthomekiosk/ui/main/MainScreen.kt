@@ -13,16 +13,12 @@ import android.net.http.SslError
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
-import android.os.Handler
-import android.os.Looper
 import android.provider.Settings as AndroidSettings
 import android.speech.RecognitionListener
 import android.speech.RecognizerIntent
 import android.speech.SpeechRecognizer
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
-import android.media.AudioManager
-import android.media.AudioAttributes
 import android.media.MediaPlayer
 import android.util.Base64
 import android.util.Log
@@ -1275,18 +1271,6 @@ private fun setupWebView(webView: WebView, context: Context, settings: KioskSett
             }
         }
 
-        override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
-            super.onPageStarted(view, url, favicon)
-            injectSpeechPolyfill(view)
-            injectAudioPolyfill(view)
-        }
-
-        override fun onPageCommitVisible(view: WebView?, url: String?) {
-            super.onPageCommitVisible(view, url)
-            injectSpeechPolyfill(view)
-            injectAudioPolyfill(view)
-        }
-
         override fun onPageFinished(view: WebView?, url: String?) {
             super.onPageFinished(view, url)
             injectSpeechPolyfill(view)
@@ -1323,103 +1307,81 @@ private fun setupWebView(webView: WebView, context: Context, settings: KioskSett
 private fun injectSpeechPolyfill(view: WebView?) {
     val script = """
         (function() {
-            class WebviewSpeechRecognition {
-                constructor() {
-                    this.continuous = false;
-                    this.interimResults = false;
-                    this.lang = 'de-DE';
-                    this.onstart = null;
-                    this.onend = null;
-                    this.onerror = null;
-                    this.onresult = null;
-                    this._isListening = false;
-                }
-                start() {
-                    if (this._isListening) return;
-                    this._isListening = true;
-                    window._activeRecognition = this;
-                    if (window.AndroidSpeech) {
-                        window.AndroidSpeech.startListening(this.lang);
+            if (!window.SpeechRecognition && !window.webkitSpeechRecognition) {
+                class WebviewSpeechRecognition {
+                    constructor() {
+                        this.continuous = false;
+                        this.interimResults = false;
+                        this.lang = 'de-DE';
+                        this.onstart = null;
+                        this.onend = null;
+                        this.onerror = null;
+                        this.onresult = null;
+                        this._isListening = false;
+                    }
+                    start() {
+                        if (this._isListening) return;
+                        this._isListening = true;
+                        if (window.AndroidSpeech) {
+                            window.AndroidSpeech.startListening(this.lang);
+                        }
+                    }
+                    stop() {
+                        this._isListening = false;
+                        if (window.AndroidSpeech) {
+                            window.AndroidSpeech.stopListening();
+                        }
+                    }
+                    abort() {
+                        this._isListening = false;
+                        if (window.AndroidSpeech) {
+                            window.AndroidSpeech.stopListening();
+                        }
                     }
                 }
-                stop() {
-                    this._isListening = false;
-                    if (window.AndroidSpeech) {
-                        window.AndroidSpeech.stopListening();
-                    }
-                }
-                abort() {
-                    this.stop();
-                }
-            }
 
-            try {
                 window.SpeechRecognition = WebviewSpeechRecognition;
                 window.webkitSpeechRecognition = WebviewSpeechRecognition;
-            } catch(e) {}
+                window._currentSpeechRecognition = null;
 
-            try {
-                Object.defineProperty(window, 'SpeechRecognition', {
-                    value: WebviewSpeechRecognition,
-                    writable: true,
-                    configurable: true
-                });
-                Object.defineProperty(window, 'webkitSpeechRecognition', {
-                    value: WebviewSpeechRecognition,
-                    writable: true,
-                    configurable: true
-                });
-            } catch(e) {}
-
-            // Prevent WebView getUserMedia(audio) while native SpeechRecognizer owns the mic.
-            // A WebView mic capture with echoCancellation switches Android into MODE_IN_COMMUNICATION,
-            // which reroutes/mutes media playback (Webradio) on tablets.
-            try {
-                if (window.AndroidSpeech && navigator.mediaDevices && navigator.mediaDevices.getUserMedia && !window._gumPatched) {
-                    window._gumPatched = true;
-                    const origGum = navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices);
-                    navigator.mediaDevices.getUserMedia = function(constraints) {
-                        if (constraints && constraints.audio && !constraints.video) {
-                            try { return Promise.resolve(new MediaStream()); } catch (e) { return Promise.reject(e); }
-                        }
-                        return origGum(constraints);
-                    };
-                }
-            } catch(e) {}
-
-            window._activeRecognition = null;
-
-            window._onNativeSpeechStart = function() {
-                if (window._activeRecognition && window._activeRecognition.onstart) {
-                    window._activeRecognition.onstart();
-                }
-            };
-
-            window._onNativeSpeechResult = function(transcript, isFinal) {
-                if (window._activeRecognition && window._activeRecognition.onresult) {
-                    const event = {
-                        resultIndex: 0,
-                        results: [[{ transcript: transcript, confidence: 1.0 }]]
-                    };
-                    event.results[0].isFinal = isFinal;
-                    window._activeRecognition.onresult(event);
-                }
-            };
-
-            window._onNativeSpeechError = function(errorMsg) {
-                if (window._activeRecognition && window._activeRecognition.onerror) {
-                    window._activeRecognition.onerror({ error: errorMsg });
-                }
-            };
-
-            window._onNativeSpeechEnd = function() {
-                if (window._activeRecognition) {
-                    window._activeRecognition._isListening = false;
-                    if (window._activeRecognition.onend) {
-                        window._activeRecognition.onend();
+                window._onNativeSpeechStart = function() {
+                    if (window._activeRecognition && window._activeRecognition.onstart) {
+                        window._activeRecognition.onstart();
                     }
-                }
-            };
+                };
+
+                window._onNativeSpeechResult = function(transcript, isFinal) {
+                    if (window._activeRecognition && window._activeRecognition.onresult) {
+                        const event = {
+                            resultIndex: 0,
+                            results: [[{ transcript: transcript, confidence: 1.0 }]]
+                        };
+                        event.results[0].isFinal = isFinal;
+                        window._activeRecognition.onresult(event);
+                    }
+                };
+
+                window._onNativeSpeechError = function(errorMsg) {
+                    if (window._activeRecognition && window._activeRecognition.onerror) {
+                        window._activeRecognition.onerror({ error: errorMsg });
+                    }
+                };
+
+                window._onNativeSpeechEnd = function() {
+                    if (window._activeRecognition) {
+                        window._activeRecognition._isListening = false;
+                        if (window._activeRecognition.onend) {
+                            window._activeRecognition.onend();
+                        }
+                    }
+                };
+
+                const origStart = WebviewSpeechRecognition.prototype.start;
+                WebviewSpeechRecognition.prototype.start = function() {
+                    window._activeRecognition = this;
+                    origStart.call(this);
+                };
+            }
 
             if (!window.speechSynthesis) {
                 window.speechSynthesis = {
@@ -1585,112 +1547,6 @@ private fun injectAudioPolyfill(view: WebView?) {
                     }
                     if (window._activeAudioShims) delete window._activeAudioShims[id];
                 };
-
-                // Native streaming bridge for Webradio: avoids Chromium audio-focus pauses during continuous speech recognition
-                const volDesc = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'volume');
-                const pausedDesc = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'paused');
-                window._nativeRadioPending = null;
-
-                // Called from Kotlin: state = 'playing' | 'error'
-                window._onNativeRadioState = function(token, state, msg) {
-                    const p = window._nativeRadioPending;
-                    if (!p || p.token !== token) return;
-                    window._nativeRadioPending = null;
-                    if (state === 'playing') {
-                        p.el._nativeActive = true;
-                        p.el.dispatchEvent(new Event('play'));
-                        p.resolve();
-                    } else {
-                        console.warn('[NativeRadio] native playback failed, falling back to WebView audio:', msg);
-                        p.el._nativeActive = false;
-                        p.fallback();
-                    }
-                };
-
-                function toNativeUrl(src) {
-                    try {
-                        const u = new URL(src, window.location.href);
-                        if (u.pathname.indexOf('/api/radio/proxy-stream') !== -1 && u.searchParams.get('url')) {
-                            return u.searchParams.get('url');
-                        }
-                        return u.href;
-                    } catch (e) { return src; }
-                }
-
-                function patchAudioElement(el) {
-                    if (!el || el._nativeRadioPatched) return;
-                    el._nativeRadioPatched = true;
-                    el._nativeActive = false;
-                    const origPlay = el.play;
-                    const origPause = el.pause;
-                    el.play = function() {
-                        const self = this;
-                        const src = self.currentSrc || self.src || '';
-                        let isHttp = false;
-                        try { isHttp = /^https?:$/i.test(new URL(src, window.location.href).protocol); } catch (e) {}
-                        const usable = self.id === 'audioPlayer' && window.AndroidAudioPlayer && src && isHttp;
-                        if (!usable) {
-                            return origPlay.apply(self, arguments);
-                        }
-                        const token = 'r' + Date.now() + Math.random().toString(36).substr(2, 5);
-                        return new Promise(function(resolve, reject) {
-                            window._nativeRadioPending = {
-                                token: token, el: self, resolve: resolve,
-                                fallback: function() {
-                                    try {
-                                        const r = origPlay.apply(self);
-                                        if (r && r.then) r.then(resolve, reject); else resolve();
-                                    } catch (e) { reject(e); }
-                                }
-                            };
-                            const vol = self._nativeVol !== undefined ? self._nativeVol : 1.0;
-                            window.AndroidAudioPlayer.playRadioStream(toNativeUrl(src), token, vol);
-                        });
-                    };
-                    el.pause = function() {
-                        if (this.id === 'audioPlayer' && window.AndroidAudioPlayer) {
-                            window._nativeRadioPending = null;
-                            window.AndroidAudioPlayer.stopRadioStream();
-                            if (this._nativeActive) {
-                                this._nativeActive = false;
-                                this.dispatchEvent(new Event('pause'));
-                                return;
-                            }
-                        }
-                        return origPause.apply(this, arguments);
-                    };
-                    try {
-                        Object.defineProperty(el, 'volume', {
-                            get: function() { return this._nativeVol !== undefined ? this._nativeVol : volDesc.get.call(this); },
-                            set: function(val) {
-                                this._nativeVol = val;
-                                try { volDesc.set.call(this, val); } catch (e) {}
-                                if (window.AndroidAudioPlayer && window.AndroidAudioPlayer.setRadioVolume) {
-                                    window.AndroidAudioPlayer.setRadioVolume(val);
-                                }
-                            },
-                            configurable: true
-                        });
-                        Object.defineProperty(el, 'paused', {
-                            get: function() { return this._nativeActive ? false : pausedDesc.get.call(this); },
-                            configurable: true
-                        });
-                    } catch(e) {}
-                }
-
-                try {
-                    const existing = document.getElementById('audioPlayer');
-                    if (existing) patchAudioElement(existing);
-
-                    const origCreateElement = document.createElement;
-                    document.createElement = function(tagName) {
-                        const el = origCreateElement.apply(this, arguments);
-                        if (tagName && typeof tagName === 'string' && tagName.toLowerCase() === 'audio') {
-                            patchAudioElement(el);
-                        }
-                        return el;
-                    };
-                } catch(e) {}
             }
         })();
     """.trimIndent()
@@ -1702,118 +1558,7 @@ class AndroidAudioPlayerInterface(
     private val webViewProvider: () -> WebView?
 ) {
     private var mediaPlayer: MediaPlayer? = null
-    private var radioPlayer: MediaPlayer? = null
     private var activeId: String? = null
-    private var radioVolume: Float = 1.0f
-    private val radioHandler = Handler(Looper.getMainLooper())
-    private var radioTimeout: Runnable? = null
-
-    private fun notifyRadioState(token: String, state: String, msg: String = "") {
-        val safeMsg = msg.replace("\\", "\\\\").replace("'", "\\'").replace("\n", " ")
-        webViewProvider()?.evaluateJavascript(
-            "if (window._onNativeRadioState) window._onNativeRadioState('$token', '$state', '$safeMsg');", null
-        )
-    }
-
-    private fun releaseRadio() {
-        radioTimeout?.let { radioHandler.removeCallbacks(it) }
-        radioTimeout = null
-        try { radioPlayer?.stop() } catch (_: Exception) {}
-        try { radioPlayer?.release() } catch (_: Exception) {}
-        radioPlayer = null
-    }
-
-    @JavascriptInterface
-    fun playRadioStream(url: String, token: String, volume: Float) {
-        (context as? Activity)?.runOnUiThread {
-            releaseRadio()
-            if (url.isEmpty()) {
-                notifyRadioState(token, "error", "empty url")
-                return@runOnUiThread
-            }
-            radioVolume = volume.coerceIn(0f, 1f)
-
-            try {
-                val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
-                // Media must never be routed through the voice-communication path
-                if (audioManager.mode != AudioManager.MODE_NORMAL) {
-                    Log.w("AndroidAudioPlayer", "Audio mode was ${audioManager.mode}, forcing MODE_NORMAL")
-                    audioManager.mode = AudioManager.MODE_NORMAL
-                }
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                    audioManager.adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_UNMUTE, 0)
-                }
-                val currentVol = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC)
-                val maxVol = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
-                if (currentVol <= 1 && maxVol > 0) {
-                    val targetVol = (maxVol * 0.6).toInt().coerceAtLeast(1)
-                    audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, targetVol, AudioManager.FLAG_SHOW_UI)
-                    Log.i("AndroidAudioPlayer", "STREAM_MUSIC was $currentVol, raised to $targetVol / $maxVol")
-                }
-            } catch (e: Exception) {
-                Log.w("AndroidAudioPlayer", "Error preparing audio output", e)
-            }
-
-            try {
-                val player = MediaPlayer()
-                radioPlayer = player
-                player.setAudioAttributes(
-                    AudioAttributes.Builder()
-                        .setUsage(AudioAttributes.USAGE_MEDIA)
-                        .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
-                        .build()
-                )
-                player.setDataSource(context, Uri.parse(url), mapOf("User-Agent" to "Mozilla/5.0 (Linux; Android) NeoKiosk"))
-                player.setOnPreparedListener { mp ->
-                    if (radioPlayer !== mp) return@setOnPreparedListener
-                    radioTimeout?.let { radioHandler.removeCallbacks(it) }
-                    radioTimeout = null
-                    mp.setVolume(radioVolume, radioVolume)
-                    mp.start()
-                    Log.i("AndroidAudioPlayer", "Native radio playback started: $url (vol=$radioVolume)")
-                    notifyRadioState(token, "playing")
-                }
-                player.setOnErrorListener { mp, what, extra ->
-                    Log.e("AndroidAudioPlayer", "Radio playback error: what=$what extra=$extra url=$url")
-                    if (radioPlayer === mp) releaseRadio()
-                    notifyRadioState(token, "error", "what=$what extra=$extra")
-                    true
-                }
-                val timeout = Runnable {
-                    if (radioPlayer === player) {
-                        Log.e("AndroidAudioPlayer", "Radio prepare timeout: $url")
-                        releaseRadio()
-                        notifyRadioState(token, "error", "timeout")
-                    }
-                }
-                radioTimeout = timeout
-                radioHandler.postDelayed(timeout, 15000)
-                player.prepareAsync()
-            } catch (e: Exception) {
-                Log.e("AndroidAudioPlayer", "Error starting radio stream", e)
-                releaseRadio()
-                notifyRadioState(token, "error", e.message ?: "exception")
-            }
-        }
-    }
-
-    @JavascriptInterface
-    fun setRadioVolume(volume: Float) {
-        (context as? Activity)?.runOnUiThread {
-            try {
-                radioVolume = volume.coerceIn(0f, 1f)
-                radioPlayer?.setVolume(radioVolume, radioVolume)
-            } catch (_: Exception) {}
-        }
-    }
-
-    @JavascriptInterface
-    fun stopRadioStream() {
-        (context as? Activity)?.runOnUiThread {
-            releaseRadio()
-            Log.i("AndroidAudioPlayer", "Native radio playback stopped")
-        }
-    }
 
     @JavascriptInterface
     fun playBase64(id: String, base64Data: String) {
@@ -1881,38 +1626,11 @@ class AndroidSpeechInterface(
     private val context: Context,
     private val webViewProvider: () -> WebView?
 ) {
-    private val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
     private var speechRecognizer: SpeechRecognizer? = null
     private var textToSpeech: TextToSpeech? = null
     private var isTtsReady = false
 
-    private var isMuted = false
-    private var origSystemVolume: Int? = null
-    private var origNotificationVolume: Int? = null
-
-    // Tablets without voice telephony alias STREAM_SYSTEM -> STREAM_MUSIC (AudioService STREAM_VOLUME_ALIAS_DEFAULT)
-    private var systemAliasedToMusic: Boolean = try {
-        val tm = context.getSystemService(Context.TELEPHONY_SERVICE) as? android.telephony.TelephonyManager
-        tm == null || !tm.isVoiceCapable
-    } catch (_: Exception) { true }
-
     init {
-        // Ensure STREAM_MUSIC is completely unmuted and restored if previously silenced
-        try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                audioManager.adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_UNMUTE, 0)
-            }
-            val currentMusicVol = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC)
-            if (currentMusicVol == 0) {
-                val maxVol = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
-                val targetVol = if (maxVol > 0) (maxVol * 0.6).toInt().coerceAtLeast(1) else 10
-                audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, targetVol, 0)
-                Log.i("AndroidSpeechInterface", "Restored STREAM_MUSIC from 0 to $targetVol")
-            }
-        } catch (e: Exception) {
-            Log.w("AndroidSpeechInterface", "Error restoring STREAM_MUSIC volume", e)
-        }
-
         (context as? Activity)?.runOnUiThread {
             textToSpeech = TextToSpeech(context) { status ->
                 if (status == TextToSpeech.SUCCESS) {
@@ -1940,203 +1658,63 @@ class AndroidSpeechInterface(
         }
     }
 
-    @Synchronized
-    private fun muteSpeechEarcons() {
-        if (isMuted) return
-        try {
-            val musicVolBefore = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC)
-            val musicMutedBefore = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) audioManager.isStreamMute(AudioManager.STREAM_MUSIC) else false
-
-            origSystemVolume = audioManager.getStreamVolume(AudioManager.STREAM_SYSTEM)
-            origNotificationVolume = try {
-                audioManager.getStreamVolume(AudioManager.STREAM_NOTIFICATION)
-            } catch (_: Exception) { null }
-
-            // On tablets without telephony (e.g. Lenovo Idea Tab) Android aliases STREAM_SYSTEM
-            // to STREAM_MUSIC. Muting SYSTEM there silently mutes ALL media (Webradio!).
-            // Only touch STREAM_SYSTEM if it is a separate stream on this device.
-            if (!systemAliasedToMusic) {
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                    audioManager.adjustStreamVolume(AudioManager.STREAM_SYSTEM, AudioManager.ADJUST_MUTE, 0)
-                } else {
-                    @Suppress("DEPRECATION")
-                    audioManager.setStreamMute(AudioManager.STREAM_SYSTEM, true)
-                }
-
-                // Safety check: did muting SYSTEM also hit MUSIC?
-                val musicVolAfter = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC)
-                val musicMutedAfter = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) audioManager.isStreamMute(AudioManager.STREAM_MUSIC) else false
-                if (musicVolAfter != musicVolBefore || (musicMutedAfter && !musicMutedBefore)) {
-                    Log.w("AndroidSpeechInterface", "STREAM_SYSTEM is aliased to STREAM_MUSIC on this device -> not muting system stream")
-                    systemAliasedToMusic = true
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                        audioManager.adjustStreamVolume(AudioManager.STREAM_SYSTEM, AudioManager.ADJUST_UNMUTE, 0)
-                        audioManager.adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_UNMUTE, 0)
-                    } else {
-                        @Suppress("DEPRECATION")
-                        audioManager.setStreamMute(AudioManager.STREAM_SYSTEM, false)
-                    }
-                    try { audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, musicVolBefore, 0) } catch (_: Exception) {}
-                    origSystemVolume = null
-                }
-            }
-
-            try {
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                    audioManager.adjustStreamVolume(AudioManager.STREAM_NOTIFICATION, AudioManager.ADJUST_MUTE, 0)
-                } else {
-                    @Suppress("DEPRECATION")
-                    audioManager.setStreamMute(AudioManager.STREAM_NOTIFICATION, true)
-                }
-            } catch (_: SecurityException) {}
-
-            // Final guard: media must stay audible no matter what
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && audioManager.isStreamMute(AudioManager.STREAM_MUSIC) && !musicMutedBefore) {
-                audioManager.adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_UNMUTE, 0)
-            }
-
-            isMuted = true
-            Log.d("AndroidSpeechInterface", "Speech earcons muted (systemAliasedToMusic=$systemAliasedToMusic)")
-        } catch (e: Exception) {
-            Log.w("AndroidSpeechInterface", "Error muting speech earcon streams", e)
-        }
-    }
-
-    @Synchronized
-    private fun restoreSpeechEarcons() {
-        if (!isMuted) return
-        try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                audioManager.adjustStreamVolume(AudioManager.STREAM_SYSTEM, AudioManager.ADJUST_UNMUTE, 0)
-                try {
-                    audioManager.adjustStreamVolume(AudioManager.STREAM_NOTIFICATION, AudioManager.ADJUST_UNMUTE, 0)
-                } catch (_: SecurityException) {}
-            } else {
-                @Suppress("DEPRECATION")
-                audioManager.setStreamMute(AudioManager.STREAM_SYSTEM, false)
-                @Suppress("DEPRECATION")
-                audioManager.setStreamMute(AudioManager.STREAM_NOTIFICATION, false)
-            }
-
-            if (!systemAliasedToMusic) origSystemVolume?.let { vol ->
-                try {
-                    audioManager.setStreamVolume(AudioManager.STREAM_SYSTEM, vol, 0)
-                } catch (_: Exception) {}
-            }
-            origNotificationVolume?.let { vol ->
-                try {
-                    audioManager.setStreamVolume(AudioManager.STREAM_NOTIFICATION, vol, 0)
-                } catch (_: Exception) {}
-            }
-            Log.d("AndroidSpeechInterface", "Speech earcons restored")
-        } catch (e: Exception) {
-            Log.w("AndroidSpeechInterface", "Error restoring speech earcon streams", e)
-        } finally {
-            isMuted = false
-            origSystemVolume = null
-            origNotificationVolume = null
-        }
-    }
-
-    private fun getOrCreateSpeechRecognizer(): SpeechRecognizer {
-        speechRecognizer?.let { return it }
-
-        val recognizer = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && SpeechRecognizer.isOnDeviceRecognitionAvailable(context)) {
-            Log.i("AndroidSpeechInterface", "Using OnDeviceSpeechRecognizer (zero latency, offline)")
-            SpeechRecognizer.createOnDeviceSpeechRecognizer(context)
-        } else {
-            Log.i("AndroidSpeechInterface", "Using standard SpeechRecognizer")
-            SpeechRecognizer.createSpeechRecognizer(context)
-        }
-        speechRecognizer = recognizer
-        setupRecognitionListener(recognizer)
-        return recognizer
-    }
-
-    private fun setupRecognitionListener(recognizer: SpeechRecognizer) {
-        recognizer.setRecognitionListener(object : RecognitionListener {
-            override fun onReadyForSpeech(params: Bundle?) {
-                (context as? Activity)?.runOnUiThread {
-                    webViewProvider()?.evaluateJavascript("if(window._onNativeSpeechStart) window._onNativeSpeechStart();", null)
-                }
-            }
-            override fun onBeginningOfSpeech() {}
-            override fun onRmsChanged(rmsdB: Float) {}
-            override fun onBufferReceived(buffer: ByteArray?) {}
-            override fun onEndOfSpeech() {}
-            override fun onError(error: Int) {
-                val errorMsg = when (error) {
-                    SpeechRecognizer.ERROR_AUDIO -> "audio"
-                    SpeechRecognizer.ERROR_CLIENT -> "client"
-                    SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> "not-allowed"
-                    SpeechRecognizer.ERROR_NETWORK -> "network"
-                    SpeechRecognizer.ERROR_NETWORK_TIMEOUT -> "network"
-                    SpeechRecognizer.ERROR_NO_MATCH -> "no-speech"
-                    SpeechRecognizer.ERROR_RECOGNIZER_BUSY -> "busy"
-                    SpeechRecognizer.ERROR_SERVER -> "network"
-                    SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> "no-speech"
-                    else -> "aborted"
-                }
-
-                // If recognizer is busy or failed critically, reset it so next cycle starts cleanly
-                if (error == SpeechRecognizer.ERROR_RECOGNIZER_BUSY || error == SpeechRecognizer.ERROR_CLIENT) {
-                    try {
-                        speechRecognizer?.cancel()
-                        speechRecognizer?.destroy()
-                        speechRecognizer = null
-                    } catch (_: Exception) {}
-                }
-
-                (context as? Activity)?.runOnUiThread {
-                    webViewProvider()?.evaluateJavascript("if(window._onNativeSpeechError) window._onNativeSpeechError('$errorMsg');", null)
-                    webViewProvider()?.evaluateJavascript("if(window._onNativeSpeechEnd) window._onNativeSpeechEnd();", null)
-                }
-            }
-            override fun onResults(results: Bundle?) {
-                val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-                (context as? Activity)?.runOnUiThread {
-                    if (!matches.isNullOrEmpty()) {
-                        val text = matches[0].replace("\\", "\\\\").replace("'", "\\'")
-                        webViewProvider()?.evaluateJavascript("if(window._onNativeSpeechResult) window._onNativeSpeechResult('$text', true);", null)
-                    }
-                    webViewProvider()?.evaluateJavascript("if(window._onNativeSpeechEnd) window._onNativeSpeechEnd();", null)
-                }
-            }
-            override fun onPartialResults(partialResults: Bundle?) {
-                val matches = partialResults?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-                if (!matches.isNullOrEmpty()) {
-                    val text = matches[0].replace("\\", "\\\\").replace("'", "\\'")
-                    (context as? Activity)?.runOnUiThread {
-                        webViewProvider()?.evaluateJavascript("if(window._onNativeSpeechResult) window._onNativeSpeechResult('$text', false);", null)
-                    }
-                }
-            }
-            override fun onEvent(eventType: Int, params: Bundle?) {}
-        })
-    }
-
     @JavascriptInterface
     fun startListening(lang: String) {
         (context as? Activity)?.runOnUiThread {
             try {
-                muteSpeechEarcons()
+                if (speechRecognizer == null) {
+                    speechRecognizer = SpeechRecognizer.createSpeechRecognizer(context)
+                }
 
-                val recognizer = getOrCreateSpeechRecognizer()
+                speechRecognizer?.setRecognitionListener(object : RecognitionListener {
+                    override fun onReadyForSpeech(params: Bundle?) {
+                        webViewProvider()?.evaluateJavascript("if(window._onNativeSpeechStart) window._onNativeSpeechStart();", null)
+                    }
+                    override fun onBeginningOfSpeech() {}
+                    override fun onRmsChanged(rmsdB: Float) {}
+                    override fun onBufferReceived(buffer: ByteArray?) {}
+                    override fun onEndOfSpeech() {}
+                    override fun onError(error: Int) {
+                        val errorMsg = when (error) {
+                            SpeechRecognizer.ERROR_AUDIO -> "audio"
+                            SpeechRecognizer.ERROR_CLIENT -> "client"
+                            SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> "not-allowed"
+                            SpeechRecognizer.ERROR_NETWORK -> "network"
+                            SpeechRecognizer.ERROR_NETWORK_TIMEOUT -> "network"
+                            SpeechRecognizer.ERROR_NO_MATCH -> "no-speech"
+                            SpeechRecognizer.ERROR_RECOGNIZER_BUSY -> "busy"
+                            SpeechRecognizer.ERROR_SERVER -> "network"
+                            SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> "no-speech"
+                            else -> "aborted"
+                        }
+                        webViewProvider()?.evaluateJavascript("if(window._onNativeSpeechError) window._onNativeSpeechError('$errorMsg');", null)
+                    }
+                    override fun onResults(results: Bundle?) {
+                        val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                        if (!matches.isNullOrEmpty()) {
+                            val text = matches[0].replace("'", "\\'")
+                            webViewProvider()?.evaluateJavascript("if(window._onNativeSpeechResult) window._onNativeSpeechResult('$text', true);", null)
+                        }
+                        webViewProvider()?.evaluateJavascript("if(window._onNativeSpeechEnd) window._onNativeSpeechEnd();", null)
+                    }
+                    override fun onPartialResults(partialResults: Bundle?) {
+                        val matches = partialResults?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                        if (!matches.isNullOrEmpty()) {
+                            val text = matches[0].replace("'", "\\'")
+                            webViewProvider()?.evaluateJavascript("if(window._onNativeSpeechResult) window._onNativeSpeechResult('$text', false);", null)
+                        }
+                    }
+                    override fun onEvent(eventType: Int, params: Bundle?) {}
+                })
 
                 val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
                     putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
                     putExtra(RecognizerIntent.EXTRA_LANGUAGE, if (lang.isNotEmpty()) lang else "de-DE")
                     putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
-                    putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, true)
-                    putExtra("android.speech.extra.DICTATION_MODE", true)
                 }
-                recognizer.startListening(intent)
+                speechRecognizer?.startListening(intent)
             } catch (e: Exception) {
                 Log.e("AndroidSpeechInterface", "Error starting speech recognition", e)
-                try {
-                    speechRecognizer?.destroy()
-                    speechRecognizer = null
-                } catch (_: Exception) {}
             }
         }
     }
@@ -2146,7 +1724,6 @@ class AndroidSpeechInterface(
         (context as? Activity)?.runOnUiThread {
             try {
                 speechRecognizer?.stopListening()
-                restoreSpeechEarcons()
             } catch (e: Exception) {
                 Log.e("AndroidSpeechInterface", "Error stopping speech recognition", e)
             }
