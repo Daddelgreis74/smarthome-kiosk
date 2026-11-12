@@ -1594,6 +1594,18 @@ private fun injectAudioPolyfill(view: WebView?) {
                         }
                         return origPause.apply(this, arguments);
                     };
+                    try {
+                        Object.defineProperty(el, 'volume', {
+                            get: function() { return this._nativeVol !== undefined ? this._nativeVol : 0.8; },
+                            set: function(val) {
+                                this._nativeVol = val;
+                                if (window.AndroidAudioPlayer && window.AndroidAudioPlayer.setRadioVolume) {
+                                    window.AndroidAudioPlayer.setRadioVolume(val);
+                                }
+                            },
+                            configurable: true
+                        });
+                    } catch(e) {}
                 }
 
                 try {
@@ -1633,6 +1645,23 @@ class AndroidAudioPlayerInterface(
 
                 if (url.isEmpty()) return@runOnUiThread
 
+                // Force unmute STREAM_MUSIC and ensure audible volume
+                try {
+                    val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                        audioManager.adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_UNMUTE, 0)
+                    }
+                    val currentVol = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC)
+                    val maxVol = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
+                    if (currentVol <= 1 && maxVol > 0) {
+                        val targetVol = (maxVol * 0.75).toInt().coerceAtLeast(1)
+                        audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, targetVol, AudioManager.FLAG_SHOW_UI)
+                        Log.i("AndroidAudioPlayer", "Forced STREAM_MUSIC un-mute to $targetVol / $maxVol")
+                    }
+                } catch (e: Exception) {
+                    Log.w("AndroidAudioPlayer", "Error ensuring STREAM_MUSIC volume", e)
+                }
+
                 val player = MediaPlayer().apply {
                     setAudioAttributes(
                         AudioAttributes.Builder()
@@ -1641,6 +1670,7 @@ class AndroidAudioPlayerInterface(
                             .build()
                     )
                     setDataSource(url)
+                    setVolume(1.0f, 1.0f)
                     setOnPreparedListener { mp ->
                         mp.start()
                         Log.i("AndroidAudioPlayer", "Native radio playback started: $url")
@@ -1655,6 +1685,16 @@ class AndroidAudioPlayerInterface(
             } catch (e: Exception) {
                 Log.e("AndroidAudioPlayer", "Error starting radio stream", e)
             }
+        }
+    }
+
+    @JavascriptInterface
+    fun setRadioVolume(volume: Float) {
+        (context as? Activity)?.runOnUiThread {
+            try {
+                val clamped = volume.coerceIn(0f, 1f)
+                radioPlayer?.setVolume(clamped, clamped)
+            } catch (_: Exception) {}
         }
     }
 
