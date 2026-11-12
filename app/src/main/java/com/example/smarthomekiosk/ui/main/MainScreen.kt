@@ -1372,6 +1372,26 @@ private fun injectSpeechPolyfill(view: WebView?) {
 
             window._activeRecognition = null;
 
+            // Prevent audio interruptions: Auto-resume radio stream if Chromium triggers an involuntary pause on AudioFocus loss
+            document.addEventListener('pause', function(e) {
+                if (e.target && e.target.id === 'audioPlayer') {
+                    if (window._activeRecognition && !e.target._manuallyPaused && e.target.src && e.target.isConnected) {
+                        setTimeout(function() {
+                            if (e.target && e.target.id === 'audioPlayer' && e.target.paused && !e.target._manuallyPaused && e.target.src && e.target.isConnected) {
+                                console.log('[Kiosk] Auto-resuming radio stream after speech audio focus transition');
+                                e.target.play().catch(function() {});
+                            }
+                        }, 50);
+                    }
+                }
+            }, true);
+
+            document.addEventListener('play', function(e) {
+                if (e.target && e.target.id === 'audioPlayer') {
+                    e.target._manuallyPaused = false;
+                }
+            }, true);
+
             window._onNativeSpeechStart = function() {
                 if (window._activeRecognition && window._activeRecognition.onstart) {
                     window._activeRecognition.onstart();
@@ -1648,7 +1668,6 @@ class AndroidSpeechInterface(
     private val webViewProvider: () -> WebView?
 ) {
     private val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
-    private val musicUnmuteHandler = Handler(Looper.getMainLooper())
     private var speechRecognizer: SpeechRecognizer? = null
     private var textToSpeech: TextToSpeech? = null
     private var isTtsReady = false
@@ -1656,9 +1675,24 @@ class AndroidSpeechInterface(
     private var isMuted = false
     private var origSystemVolume: Int? = null
     private var origNotificationVolume: Int? = null
-    private var origMusicVolume: Int? = null
 
     init {
+        // Ensure STREAM_MUSIC is completely unmuted and restored if previously silenced
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                audioManager.adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_UNMUTE, 0)
+            }
+            val currentMusicVol = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC)
+            if (currentMusicVol == 0) {
+                val maxVol = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
+                val targetVol = if (maxVol > 0) (maxVol * 0.6).toInt().coerceAtLeast(1) else 10
+                audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, targetVol, 0)
+                Log.i("AndroidSpeechInterface", "Restored STREAM_MUSIC from 0 to $targetVol")
+            }
+        } catch (e: Exception) {
+            Log.w("AndroidSpeechInterface", "Error restoring STREAM_MUSIC volume", e)
+        }
+
         (context as? Activity)?.runOnUiThread {
             textToSpeech = TextToSpeech(context) { status ->
                 if (status == TextToSpeech.SUCCESS) {
@@ -1688,10 +1722,7 @@ class AndroidSpeechInterface(
 
     @Synchronized
     private fun muteSpeechEarcons() {
-        if (isMuted) {
-            dipMusicForEarcon()
-            return
-        }
+        if (isMuted) return
         try {
             origSystemVolume = audioManager.getStreamVolume(AudioManager.STREAM_SYSTEM)
             origNotificationVolume = try {
@@ -1699,6 +1730,7 @@ class AndroidSpeechInterface(
             } catch (_: Exception) { null }
 
             // Mute STREAM_SYSTEM & STREAM_NOTIFICATION to silence Google start/stop beeps (earcons).
+            // STREAM_MUSIC is deliberately UNTOUCHED so Webradio continues uninterrupted!
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
                 audioManager.adjustStreamVolume(AudioManager.STREAM_SYSTEM, AudioManager.ADJUST_MUTE, 0)
                 try {
@@ -1716,52 +1748,15 @@ class AndroidSpeechInterface(
                 audioManager.setStreamVolume(AudioManager.STREAM_SYSTEM, 0, 0)
             } catch (_: Exception) {}
 
-            dipMusicForEarcon()
-
             isMuted = true
-            Log.d("AndroidSpeechInterface", "Speech earcons muted (system: 0, music dipped)")
+            Log.d("AndroidSpeechInterface", "Speech earcons muted (system: 0, music untouched)")
         } catch (e: Exception) {
             Log.w("AndroidSpeechInterface", "Error muting speech earcon streams", e)
         }
     }
 
-    private fun dipMusicForEarcon() {
-        try {
-            if (origMusicVolume == null) {
-                origMusicVolume = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC)
-            }
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                audioManager.adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_MUTE, 0)
-            }
-            try {
-                audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, 0, 0)
-            } catch (_: Exception) {}
-
-            musicUnmuteHandler.removeCallbacksAndMessages(null)
-            musicUnmuteHandler.postDelayed({
-                unmuteMusicOnly()
-            }, 350L)
-        } catch (e: Exception) {
-            Log.w("AndroidSpeechInterface", "Error dipping music volume for earcon", e)
-        }
-    }
-
-    private fun unmuteMusicOnly() {
-        try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                audioManager.adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_UNMUTE, 0)
-            }
-            origMusicVolume?.let { vol ->
-                audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, vol, 0)
-            }
-        } catch (_: Exception) {} finally {
-            origMusicVolume = null
-        }
-    }
-
     @Synchronized
     private fun restoreSpeechEarcons() {
-        unmuteMusicOnly()
         if (!isMuted) return
         try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
@@ -1814,7 +1809,6 @@ class AndroidSpeechInterface(
     private fun setupRecognitionListener(recognizer: SpeechRecognizer) {
         recognizer.setRecognitionListener(object : RecognitionListener {
             override fun onReadyForSpeech(params: Bundle?) {
-                unmuteMusicOnly()
                 (context as? Activity)?.runOnUiThread {
                     webViewProvider()?.evaluateJavascript("if(window._onNativeSpeechStart) window._onNativeSpeechStart();", null)
                 }
@@ -1822,9 +1816,7 @@ class AndroidSpeechInterface(
             override fun onBeginningOfSpeech() {}
             override fun onRmsChanged(rmsdB: Float) {}
             override fun onBufferReceived(buffer: ByteArray?) {}
-            override fun onEndOfSpeech() {
-                dipMusicForEarcon()
-            }
+            override fun onEndOfSpeech() {}
             override fun onError(error: Int) {
                 val errorMsg = when (error) {
                     SpeechRecognizer.ERROR_AUDIO -> "audio"

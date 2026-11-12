@@ -79,6 +79,23 @@ class MainActivity : ComponentActivity() {
 
             // Check & request camera, microphone and notification permissions
             checkPermissions()
+
+            // Ensure hardware volume controls default to STREAM_MUSIC and unmute media volume
+            volumeControlStream = android.media.AudioManager.STREAM_MUSIC
+            try {
+                val audioManager = getSystemService(Context.AUDIO_SERVICE) as android.media.AudioManager
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                    audioManager.adjustStreamVolume(android.media.AudioManager.STREAM_MUSIC, android.media.AudioManager.ADJUST_UNMUTE, 0)
+                }
+                val currentVol = audioManager.getStreamVolume(android.media.AudioManager.STREAM_MUSIC)
+                if (currentVol == 0) {
+                    val maxVol = audioManager.getStreamMaxVolume(android.media.AudioManager.STREAM_MUSIC)
+                    val targetVol = if (maxVol > 0) (maxVol * 0.6).toInt().coerceAtLeast(1) else 10
+                    audioManager.setStreamVolume(android.media.AudioManager.STREAM_MUSIC, targetVol, 0)
+                }
+            } catch (e: Exception) {
+                android.util.Log.w("MainActivity", "Error restoring STREAM_MUSIC in onCreate", e)
+            }
         } catch (e: Exception) {
             android.util.Log.e("MainActivity", "Error during early initialization", e)
         }
