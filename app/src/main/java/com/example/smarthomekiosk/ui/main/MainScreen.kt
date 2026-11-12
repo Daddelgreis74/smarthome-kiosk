@@ -1372,16 +1372,28 @@ private fun injectSpeechPolyfill(view: WebView?) {
 
             window._activeRecognition = null;
 
-            // Prevent audio interruptions: Auto-resume radio stream if Chromium triggers an involuntary pause on AudioFocus loss
+            // Prevent audio interruptions: Intercept Chromium involuntary pause on #audioPlayer during speech recognition
+            try {
+                const origMediaPause = HTMLMediaElement.prototype.pause;
+                HTMLMediaElement.prototype.pause = function() {
+                    if (this.id === 'audioPlayer' && window._activeRecognition && !this._manuallyPaused && this.src && this.isConnected) {
+                        console.log('[Kiosk] Suppressed involuntary pause on #audioPlayer during speech recognition');
+                        return;
+                    }
+                    return origMediaPause.apply(this, arguments);
+                };
+            } catch(e) {}
+
             document.addEventListener('pause', function(e) {
                 if (e.target && e.target.id === 'audioPlayer') {
                     if (window._activeRecognition && !e.target._manuallyPaused && e.target.src && e.target.isConnected) {
+                        e.stopImmediatePropagation();
                         setTimeout(function() {
                             if (e.target && e.target.id === 'audioPlayer' && e.target.paused && !e.target._manuallyPaused && e.target.src && e.target.isConnected) {
                                 console.log('[Kiosk] Auto-resuming radio stream after speech audio focus transition');
                                 e.target.play().catch(function() {});
                             }
-                        }, 50);
+                        }, 20);
                     }
                 }
             }, true);
