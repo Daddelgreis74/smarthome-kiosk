@@ -22,6 +22,7 @@ import android.speech.SpeechRecognizer
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
 import android.media.AudioManager
+import android.media.AudioAttributes
 import android.media.MediaPlayer
 import android.util.Base64
 import android.util.Log
@@ -1372,38 +1373,6 @@ private fun injectSpeechPolyfill(view: WebView?) {
 
             window._activeRecognition = null;
 
-            // Prevent audio interruptions: Intercept Chromium involuntary pause on #audioPlayer during speech recognition
-            try {
-                const origMediaPause = HTMLMediaElement.prototype.pause;
-                HTMLMediaElement.prototype.pause = function() {
-                    if (this.id === 'audioPlayer' && window._activeRecognition && !this._manuallyPaused && this.src && this.isConnected) {
-                        console.log('[Kiosk] Suppressed involuntary pause on #audioPlayer during speech recognition');
-                        return;
-                    }
-                    return origMediaPause.apply(this, arguments);
-                };
-            } catch(e) {}
-
-            document.addEventListener('pause', function(e) {
-                if (e.target && e.target.id === 'audioPlayer') {
-                    if (window._activeRecognition && !e.target._manuallyPaused && e.target.src && e.target.isConnected) {
-                        e.stopImmediatePropagation();
-                        setTimeout(function() {
-                            if (e.target && e.target.id === 'audioPlayer' && e.target.paused && !e.target._manuallyPaused && e.target.src && e.target.isConnected) {
-                                console.log('[Kiosk] Auto-resuming radio stream after speech audio focus transition');
-                                e.target.play().catch(function() {});
-                            }
-                        }, 20);
-                    }
-                }
-            }, true);
-
-            document.addEventListener('play', function(e) {
-                if (e.target && e.target.id === 'audioPlayer') {
-                    e.target._manuallyPaused = false;
-                }
-            }, true);
-
             window._onNativeSpeechStart = function() {
                 if (window._activeRecognition && window._activeRecognition.onstart) {
                     window._activeRecognition.onstart();
@@ -1600,6 +1569,46 @@ private fun injectAudioPolyfill(view: WebView?) {
                     }
                     if (window._activeAudioShims) delete window._activeAudioShims[id];
                 };
+
+                // Native streaming bridge for Webradio: avoids Chromium audio-focus pauses during continuous speech recognition
+                function patchAudioElement(el) {
+                    if (!el || el._nativeRadioPatched) return;
+                    el._nativeRadioPatched = true;
+                    const origPlay = el.play;
+                    const origPause = el.pause;
+                    el.play = function() {
+                        if (this.id === 'audioPlayer' && window.AndroidAudioPlayer && this.src) {
+                            window.AndroidAudioPlayer.playRadioStream(this.src);
+                            const ev = new Event('play');
+                            this.dispatchEvent(ev);
+                            return Promise.resolve();
+                        }
+                        return origPlay.apply(this, arguments);
+                    };
+                    el.pause = function() {
+                        if (this.id === 'audioPlayer' && window.AndroidAudioPlayer) {
+                            window.AndroidAudioPlayer.stopRadioStream();
+                            const ev = new Event('pause');
+                            this.dispatchEvent(ev);
+                            return;
+                        }
+                        return origPause.apply(this, arguments);
+                    };
+                }
+
+                try {
+                    const existing = document.getElementById('audioPlayer');
+                    if (existing) patchAudioElement(existing);
+
+                    const origCreateElement = document.createElement;
+                    document.createElement = function(tagName) {
+                        const el = origCreateElement.apply(this, arguments);
+                        if (tagName && typeof tagName === 'string' && tagName.toLowerCase() === 'audio') {
+                            patchAudioElement(el);
+                        }
+                        return el;
+                    };
+                } catch(e) {}
             }
         })();
     """.trimIndent()
@@ -1611,7 +1620,57 @@ class AndroidAudioPlayerInterface(
     private val webViewProvider: () -> WebView?
 ) {
     private var mediaPlayer: MediaPlayer? = null
+    private var radioPlayer: MediaPlayer? = null
     private var activeId: String? = null
+
+    @JavascriptInterface
+    fun playRadioStream(url: String) {
+        (context as? Activity)?.runOnUiThread {
+            try {
+                radioPlayer?.stop()
+                radioPlayer?.release()
+                radioPlayer = null
+
+                if (url.isEmpty()) return@runOnUiThread
+
+                val player = MediaPlayer().apply {
+                    setAudioAttributes(
+                        AudioAttributes.Builder()
+                            .setUsage(AudioAttributes.USAGE_MEDIA)
+                            .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                            .build()
+                    )
+                    setDataSource(url)
+                    setOnPreparedListener { mp ->
+                        mp.start()
+                        Log.i("AndroidAudioPlayer", "Native radio playback started: $url")
+                    }
+                    setOnErrorListener { _, what, extra ->
+                        Log.e("AndroidAudioPlayer", "Radio playback error: what=$what extra=$extra")
+                        true
+                    }
+                    prepareAsync()
+                }
+                radioPlayer = player
+            } catch (e: Exception) {
+                Log.e("AndroidAudioPlayer", "Error starting radio stream", e)
+            }
+        }
+    }
+
+    @JavascriptInterface
+    fun stopRadioStream() {
+        (context as? Activity)?.runOnUiThread {
+            try {
+                radioPlayer?.stop()
+                radioPlayer?.release()
+                radioPlayer = null
+                Log.i("AndroidAudioPlayer", "Native radio playback stopped")
+            } catch (e: Exception) {
+                Log.e("AndroidAudioPlayer", "Error stopping radio stream", e)
+            }
+        }
+    }
 
     @JavascriptInterface
     fun playBase64(id: String, base64Data: String) {
