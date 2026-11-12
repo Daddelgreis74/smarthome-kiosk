@@ -13,6 +13,8 @@ import android.net.http.SslError
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.provider.Settings as AndroidSettings
 import android.speech.RecognitionListener
 import android.speech.RecognizerIntent
@@ -1272,6 +1274,18 @@ private fun setupWebView(webView: WebView, context: Context, settings: KioskSett
             }
         }
 
+        override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
+            super.onPageStarted(view, url, favicon)
+            injectSpeechPolyfill(view)
+            injectAudioPolyfill(view)
+        }
+
+        override fun onPageCommitVisible(view: WebView?, url: String?) {
+            super.onPageCommitVisible(view, url)
+            injectSpeechPolyfill(view)
+            injectAudioPolyfill(view)
+        }
+
         override fun onPageFinished(view: WebView?, url: String?) {
             super.onPageFinished(view, url)
             injectSpeechPolyfill(view)
@@ -1308,81 +1322,87 @@ private fun setupWebView(webView: WebView, context: Context, settings: KioskSett
 private fun injectSpeechPolyfill(view: WebView?) {
     val script = """
         (function() {
-            if (!window.SpeechRecognition && !window.webkitSpeechRecognition) {
-                class WebviewSpeechRecognition {
-                    constructor() {
-                        this.continuous = false;
-                        this.interimResults = false;
-                        this.lang = 'de-DE';
-                        this.onstart = null;
-                        this.onend = null;
-                        this.onerror = null;
-                        this.onresult = null;
-                        this._isListening = false;
-                    }
-                    start() {
-                        if (this._isListening) return;
-                        this._isListening = true;
-                        if (window.AndroidSpeech) {
-                            window.AndroidSpeech.startListening(this.lang);
-                        }
-                    }
-                    stop() {
-                        this._isListening = false;
-                        if (window.AndroidSpeech) {
-                            window.AndroidSpeech.stopListening();
-                        }
-                    }
-                    abort() {
-                        this._isListening = false;
-                        if (window.AndroidSpeech) {
-                            window.AndroidSpeech.stopListening();
-                        }
+            class WebviewSpeechRecognition {
+                constructor() {
+                    this.continuous = false;
+                    this.interimResults = false;
+                    this.lang = 'de-DE';
+                    this.onstart = null;
+                    this.onend = null;
+                    this.onerror = null;
+                    this.onresult = null;
+                    this._isListening = false;
+                }
+                start() {
+                    if (this._isListening) return;
+                    this._isListening = true;
+                    window._activeRecognition = this;
+                    if (window.AndroidSpeech) {
+                        window.AndroidSpeech.startListening(this.lang);
                     }
                 }
+                stop() {
+                    this._isListening = false;
+                    if (window.AndroidSpeech) {
+                        window.AndroidSpeech.stopListening();
+                    }
+                }
+                abort() {
+                    this.stop();
+                }
+            }
 
+            try {
                 window.SpeechRecognition = WebviewSpeechRecognition;
                 window.webkitSpeechRecognition = WebviewSpeechRecognition;
-                window._currentSpeechRecognition = null;
+            } catch(e) {}
 
-                window._onNativeSpeechStart = function() {
-                    if (window._activeRecognition && window._activeRecognition.onstart) {
-                        window._activeRecognition.onstart();
+            try {
+                Object.defineProperty(window, 'SpeechRecognition', {
+                    value: WebviewSpeechRecognition,
+                    writable: true,
+                    configurable: true
+                });
+                Object.defineProperty(window, 'webkitSpeechRecognition', {
+                    value: WebviewSpeechRecognition,
+                    writable: true,
+                    configurable: true
+                });
+            } catch(e) {}
+
+            window._activeRecognition = null;
+
+            window._onNativeSpeechStart = function() {
+                if (window._activeRecognition && window._activeRecognition.onstart) {
+                    window._activeRecognition.onstart();
+                }
+            };
+
+            window._onNativeSpeechResult = function(transcript, isFinal) {
+                if (window._activeRecognition && window._activeRecognition.onresult) {
+                    const event = {
+                        resultIndex: 0,
+                        results: [[{ transcript: transcript, confidence: 1.0 }]]
+                    };
+                    event.results[0].isFinal = isFinal;
+                    window._activeRecognition.onresult(event);
+                }
+            };
+
+            window._onNativeSpeechError = function(errorMsg) {
+                if (window._activeRecognition && window._activeRecognition.onerror) {
+                    window._activeRecognition.onerror({ error: errorMsg });
+                }
+            };
+
+            window._onNativeSpeechEnd = function() {
+                if (window._activeRecognition) {
+                    window._activeRecognition._isListening = false;
+                    if (window._activeRecognition.onend) {
+                        window._activeRecognition.onend();
                     }
-                };
-
-                window._onNativeSpeechResult = function(transcript, isFinal) {
-                    if (window._activeRecognition && window._activeRecognition.onresult) {
-                        const event = {
-                            resultIndex: 0,
-                            results: [[{ transcript: transcript, confidence: 1.0 }]]
-                        };
-                        event.results[0].isFinal = isFinal;
-                        window._activeRecognition.onresult(event);
-                    }
-                };
-
-                window._onNativeSpeechError = function(errorMsg) {
-                    if (window._activeRecognition && window._activeRecognition.onerror) {
-                        window._activeRecognition.onerror({ error: errorMsg });
-                    }
-                };
-
-                window._onNativeSpeechEnd = function() {
-                    if (window._activeRecognition) {
-                        window._activeRecognition._isListening = false;
-                        if (window._activeRecognition.onend) {
-                            window._activeRecognition.onend();
-                        }
-                    }
-                };
-
-                const origStart = WebviewSpeechRecognition.prototype.start;
-                WebviewSpeechRecognition.prototype.start = function() {
-                    window._activeRecognition = this;
-                    origStart.call(this);
-                };
-            }
+                }
+            };
 
             if (!window.speechSynthesis) {
                 window.speechSynthesis = {
@@ -1628,6 +1648,7 @@ class AndroidSpeechInterface(
     private val webViewProvider: () -> WebView?
 ) {
     private val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+    private val musicUnmuteHandler = Handler(Looper.getMainLooper())
     private var speechRecognizer: SpeechRecognizer? = null
     private var textToSpeech: TextToSpeech? = null
     private var isTtsReady = false
@@ -1635,6 +1656,7 @@ class AndroidSpeechInterface(
     private var isMuted = false
     private var origSystemVolume: Int? = null
     private var origNotificationVolume: Int? = null
+    private var origMusicVolume: Int? = null
 
     init {
         (context as? Activity)?.runOnUiThread {
@@ -1666,7 +1688,10 @@ class AndroidSpeechInterface(
 
     @Synchronized
     private fun muteSpeechEarcons() {
-        if (isMuted) return
+        if (isMuted) {
+            dipMusicForEarcon()
+            return
+        }
         try {
             origSystemVolume = audioManager.getStreamVolume(AudioManager.STREAM_SYSTEM)
             origNotificationVolume = try {
@@ -1674,7 +1699,6 @@ class AndroidSpeechInterface(
             } catch (_: Exception) { null }
 
             // Mute STREAM_SYSTEM & STREAM_NOTIFICATION to silence Google start/stop beeps (earcons).
-            // STREAM_MUSIC (Dashboard media / radio) remains untouched!
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
                 audioManager.adjustStreamVolume(AudioManager.STREAM_SYSTEM, AudioManager.ADJUST_MUTE, 0)
                 try {
@@ -1692,15 +1716,52 @@ class AndroidSpeechInterface(
                 audioManager.setStreamVolume(AudioManager.STREAM_SYSTEM, 0, 0)
             } catch (_: Exception) {}
 
+            dipMusicForEarcon()
+
             isMuted = true
-            Log.d("AndroidSpeechInterface", "Speech earcons muted (system: 0)")
+            Log.d("AndroidSpeechInterface", "Speech earcons muted (system: 0, music dipped)")
         } catch (e: Exception) {
             Log.w("AndroidSpeechInterface", "Error muting speech earcon streams", e)
         }
     }
 
+    private fun dipMusicForEarcon() {
+        try {
+            if (origMusicVolume == null) {
+                origMusicVolume = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC)
+            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                audioManager.adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_MUTE, 0)
+            }
+            try {
+                audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, 0, 0)
+            } catch (_: Exception) {}
+
+            musicUnmuteHandler.removeCallbacksAndMessages(null)
+            musicUnmuteHandler.postDelayed({
+                unmuteMusicOnly()
+            }, 350L)
+        } catch (e: Exception) {
+            Log.w("AndroidSpeechInterface", "Error dipping music volume for earcon", e)
+        }
+    }
+
+    private fun unmuteMusicOnly() {
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                audioManager.adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_UNMUTE, 0)
+            }
+            origMusicVolume?.let { vol ->
+                audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, vol, 0)
+            }
+        } catch (_: Exception) {} finally {
+            origMusicVolume = null
+        }
+    }
+
     @Synchronized
     private fun restoreSpeechEarcons() {
+        unmuteMusicOnly()
         if (!isMuted) return
         try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
@@ -1753,6 +1814,7 @@ class AndroidSpeechInterface(
     private fun setupRecognitionListener(recognizer: SpeechRecognizer) {
         recognizer.setRecognitionListener(object : RecognitionListener {
             override fun onReadyForSpeech(params: Bundle?) {
+                unmuteMusicOnly()
                 (context as? Activity)?.runOnUiThread {
                     webViewProvider()?.evaluateJavascript("if(window._onNativeSpeechStart) window._onNativeSpeechStart();", null)
                 }
@@ -1760,7 +1822,9 @@ class AndroidSpeechInterface(
             override fun onBeginningOfSpeech() {}
             override fun onRmsChanged(rmsdB: Float) {}
             override fun onBufferReceived(buffer: ByteArray?) {}
-            override fun onEndOfSpeech() {}
+            override fun onEndOfSpeech() {
+                dipMusicForEarcon()
+            }
             override fun onError(error: Int) {
                 val errorMsg = when (error) {
                     SpeechRecognizer.ERROR_AUDIO -> "audio"
