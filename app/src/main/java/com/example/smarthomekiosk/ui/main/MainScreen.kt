@@ -1371,6 +1371,22 @@ private fun injectSpeechPolyfill(view: WebView?) {
                 });
             } catch(e) {}
 
+            // Prevent WebView getUserMedia(audio) while native SpeechRecognizer owns the mic.
+            // A WebView mic capture with echoCancellation switches Android into MODE_IN_COMMUNICATION,
+            // which reroutes/mutes media playback (Webradio) on tablets.
+            try {
+                if (window.AndroidSpeech && navigator.mediaDevices && navigator.mediaDevices.getUserMedia && !window._gumPatched) {
+                    window._gumPatched = true;
+                    const origGum = navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices);
+                    navigator.mediaDevices.getUserMedia = function(constraints) {
+                        if (constraints && constraints.audio && !constraints.video) {
+                            try { return Promise.resolve(new MediaStream()); } catch (e) { return Promise.reject(e); }
+                        }
+                        return origGum(constraints);
+                    };
+                }
+            } catch(e) {}
+
             window._activeRecognition = null;
 
             window._onNativeSpeechStart = function() {
@@ -1571,38 +1587,92 @@ private fun injectAudioPolyfill(view: WebView?) {
                 };
 
                 // Native streaming bridge for Webradio: avoids Chromium audio-focus pauses during continuous speech recognition
+                const volDesc = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'volume');
+                const pausedDesc = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'paused');
+                window._nativeRadioPending = null;
+
+                // Called from Kotlin: state = 'playing' | 'error'
+                window._onNativeRadioState = function(token, state, msg) {
+                    const p = window._nativeRadioPending;
+                    if (!p || p.token !== token) return;
+                    window._nativeRadioPending = null;
+                    if (state === 'playing') {
+                        p.el._nativeActive = true;
+                        p.el.dispatchEvent(new Event('play'));
+                        p.resolve();
+                    } else {
+                        console.warn('[NativeRadio] native playback failed, falling back to WebView audio:', msg);
+                        p.el._nativeActive = false;
+                        p.fallback();
+                    }
+                };
+
+                function toNativeUrl(src) {
+                    try {
+                        const u = new URL(src, window.location.href);
+                        if (u.pathname.indexOf('/api/radio/proxy-stream') !== -1 && u.searchParams.get('url')) {
+                            return u.searchParams.get('url');
+                        }
+                        return u.href;
+                    } catch (e) { return src; }
+                }
+
                 function patchAudioElement(el) {
                     if (!el || el._nativeRadioPatched) return;
                     el._nativeRadioPatched = true;
+                    el._nativeActive = false;
                     const origPlay = el.play;
                     const origPause = el.pause;
                     el.play = function() {
-                        if (this.id === 'audioPlayer' && window.AndroidAudioPlayer && this.src) {
-                            window.AndroidAudioPlayer.playRadioStream(this.src);
-                            const ev = new Event('play');
-                            this.dispatchEvent(ev);
-                            return Promise.resolve();
+                        const self = this;
+                        const src = self.currentSrc || self.src || '';
+                        let isHttp = false;
+                        try { isHttp = /^https?:$/i.test(new URL(src, window.location.href).protocol); } catch (e) {}
+                        const usable = self.id === 'audioPlayer' && window.AndroidAudioPlayer && src && isHttp;
+                        if (!usable) {
+                            return origPlay.apply(self, arguments);
                         }
-                        return origPlay.apply(this, arguments);
+                        const token = 'r' + Date.now() + Math.random().toString(36).substr(2, 5);
+                        return new Promise(function(resolve, reject) {
+                            window._nativeRadioPending = {
+                                token: token, el: self, resolve: resolve,
+                                fallback: function() {
+                                    try {
+                                        const r = origPlay.apply(self);
+                                        if (r && r.then) r.then(resolve, reject); else resolve();
+                                    } catch (e) { reject(e); }
+                                }
+                            };
+                            const vol = self._nativeVol !== undefined ? self._nativeVol : 1.0;
+                            window.AndroidAudioPlayer.playRadioStream(toNativeUrl(src), token, vol);
+                        });
                     };
                     el.pause = function() {
                         if (this.id === 'audioPlayer' && window.AndroidAudioPlayer) {
+                            window._nativeRadioPending = null;
                             window.AndroidAudioPlayer.stopRadioStream();
-                            const ev = new Event('pause');
-                            this.dispatchEvent(ev);
-                            return;
+                            if (this._nativeActive) {
+                                this._nativeActive = false;
+                                this.dispatchEvent(new Event('pause'));
+                                return;
+                            }
                         }
                         return origPause.apply(this, arguments);
                     };
                     try {
                         Object.defineProperty(el, 'volume', {
-                            get: function() { return this._nativeVol !== undefined ? this._nativeVol : 0.8; },
+                            get: function() { return this._nativeVol !== undefined ? this._nativeVol : volDesc.get.call(this); },
                             set: function(val) {
                                 this._nativeVol = val;
+                                try { volDesc.set.call(this, val); } catch (e) {}
                                 if (window.AndroidAudioPlayer && window.AndroidAudioPlayer.setRadioVolume) {
                                     window.AndroidAudioPlayer.setRadioVolume(val);
                                 }
                             },
+                            configurable: true
+                        });
+                        Object.defineProperty(el, 'paused', {
+                            get: function() { return this._nativeActive ? false : pausedDesc.get.call(this); },
                             configurable: true
                         });
                     } catch(e) {}
@@ -1634,56 +1704,95 @@ class AndroidAudioPlayerInterface(
     private var mediaPlayer: MediaPlayer? = null
     private var radioPlayer: MediaPlayer? = null
     private var activeId: String? = null
+    private var radioVolume: Float = 1.0f
+    private val radioHandler = Handler(Looper.getMainLooper())
+    private var radioTimeout: Runnable? = null
+
+    private fun notifyRadioState(token: String, state: String, msg: String = "") {
+        val safeMsg = msg.replace("\\", "\\\\").replace("'", "\\'").replace("\n", " ")
+        webViewProvider()?.evaluateJavascript(
+            "if (window._onNativeRadioState) window._onNativeRadioState('$token', '$state', '$safeMsg');", null
+        )
+    }
+
+    private fun releaseRadio() {
+        radioTimeout?.let { radioHandler.removeCallbacks(it) }
+        radioTimeout = null
+        try { radioPlayer?.stop() } catch (_: Exception) {}
+        try { radioPlayer?.release() } catch (_: Exception) {}
+        radioPlayer = null
+    }
 
     @JavascriptInterface
-    fun playRadioStream(url: String) {
+    fun playRadioStream(url: String, token: String, volume: Float) {
         (context as? Activity)?.runOnUiThread {
+            releaseRadio()
+            if (url.isEmpty()) {
+                notifyRadioState(token, "error", "empty url")
+                return@runOnUiThread
+            }
+            radioVolume = volume.coerceIn(0f, 1f)
+
             try {
-                radioPlayer?.stop()
-                radioPlayer?.release()
-                radioPlayer = null
-
-                if (url.isEmpty()) return@runOnUiThread
-
-                // Force unmute STREAM_MUSIC and ensure audible volume
-                try {
-                    val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                        audioManager.adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_UNMUTE, 0)
-                    }
-                    val currentVol = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC)
-                    val maxVol = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
-                    if (currentVol <= 1 && maxVol > 0) {
-                        val targetVol = (maxVol * 0.75).toInt().coerceAtLeast(1)
-                        audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, targetVol, AudioManager.FLAG_SHOW_UI)
-                        Log.i("AndroidAudioPlayer", "Forced STREAM_MUSIC un-mute to $targetVol / $maxVol")
-                    }
-                } catch (e: Exception) {
-                    Log.w("AndroidAudioPlayer", "Error ensuring STREAM_MUSIC volume", e)
+                val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+                // Media must never be routed through the voice-communication path
+                if (audioManager.mode != AudioManager.MODE_NORMAL) {
+                    Log.w("AndroidAudioPlayer", "Audio mode was ${audioManager.mode}, forcing MODE_NORMAL")
+                    audioManager.mode = AudioManager.MODE_NORMAL
                 }
-
-                val player = MediaPlayer().apply {
-                    setAudioAttributes(
-                        AudioAttributes.Builder()
-                            .setUsage(AudioAttributes.USAGE_MEDIA)
-                            .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
-                            .build()
-                    )
-                    setDataSource(url)
-                    setVolume(1.0f, 1.0f)
-                    setOnPreparedListener { mp ->
-                        mp.start()
-                        Log.i("AndroidAudioPlayer", "Native radio playback started: $url")
-                    }
-                    setOnErrorListener { _, what, extra ->
-                        Log.e("AndroidAudioPlayer", "Radio playback error: what=$what extra=$extra")
-                        true
-                    }
-                    prepareAsync()
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                    audioManager.adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_UNMUTE, 0)
                 }
+                val currentVol = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC)
+                val maxVol = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
+                if (currentVol <= 1 && maxVol > 0) {
+                    val targetVol = (maxVol * 0.6).toInt().coerceAtLeast(1)
+                    audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, targetVol, AudioManager.FLAG_SHOW_UI)
+                    Log.i("AndroidAudioPlayer", "STREAM_MUSIC was $currentVol, raised to $targetVol / $maxVol")
+                }
+            } catch (e: Exception) {
+                Log.w("AndroidAudioPlayer", "Error preparing audio output", e)
+            }
+
+            try {
+                val player = MediaPlayer()
                 radioPlayer = player
+                player.setAudioAttributes(
+                    AudioAttributes.Builder()
+                        .setUsage(AudioAttributes.USAGE_MEDIA)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                        .build()
+                )
+                player.setDataSource(context, Uri.parse(url), mapOf("User-Agent" to "Mozilla/5.0 (Linux; Android) NeoKiosk"))
+                player.setOnPreparedListener { mp ->
+                    if (radioPlayer !== mp) return@setOnPreparedListener
+                    radioTimeout?.let { radioHandler.removeCallbacks(it) }
+                    radioTimeout = null
+                    mp.setVolume(radioVolume, radioVolume)
+                    mp.start()
+                    Log.i("AndroidAudioPlayer", "Native radio playback started: $url (vol=$radioVolume)")
+                    notifyRadioState(token, "playing")
+                }
+                player.setOnErrorListener { mp, what, extra ->
+                    Log.e("AndroidAudioPlayer", "Radio playback error: what=$what extra=$extra url=$url")
+                    if (radioPlayer === mp) releaseRadio()
+                    notifyRadioState(token, "error", "what=$what extra=$extra")
+                    true
+                }
+                val timeout = Runnable {
+                    if (radioPlayer === player) {
+                        Log.e("AndroidAudioPlayer", "Radio prepare timeout: $url")
+                        releaseRadio()
+                        notifyRadioState(token, "error", "timeout")
+                    }
+                }
+                radioTimeout = timeout
+                radioHandler.postDelayed(timeout, 15000)
+                player.prepareAsync()
             } catch (e: Exception) {
                 Log.e("AndroidAudioPlayer", "Error starting radio stream", e)
+                releaseRadio()
+                notifyRadioState(token, "error", e.message ?: "exception")
             }
         }
     }
@@ -1692,8 +1801,8 @@ class AndroidAudioPlayerInterface(
     fun setRadioVolume(volume: Float) {
         (context as? Activity)?.runOnUiThread {
             try {
-                val clamped = volume.coerceIn(0f, 1f)
-                radioPlayer?.setVolume(clamped, clamped)
+                radioVolume = volume.coerceIn(0f, 1f)
+                radioPlayer?.setVolume(radioVolume, radioVolume)
             } catch (_: Exception) {}
         }
     }
@@ -1701,14 +1810,8 @@ class AndroidAudioPlayerInterface(
     @JavascriptInterface
     fun stopRadioStream() {
         (context as? Activity)?.runOnUiThread {
-            try {
-                radioPlayer?.stop()
-                radioPlayer?.release()
-                radioPlayer = null
-                Log.i("AndroidAudioPlayer", "Native radio playback stopped")
-            } catch (e: Exception) {
-                Log.e("AndroidAudioPlayer", "Error stopping radio stream", e)
-            }
+            releaseRadio()
+            Log.i("AndroidAudioPlayer", "Native radio playback stopped")
         }
     }
 
@@ -1787,6 +1890,12 @@ class AndroidSpeechInterface(
     private var origSystemVolume: Int? = null
     private var origNotificationVolume: Int? = null
 
+    // Tablets without voice telephony alias STREAM_SYSTEM -> STREAM_MUSIC (AudioService STREAM_VOLUME_ALIAS_DEFAULT)
+    private var systemAliasedToMusic: Boolean = try {
+        val tm = context.getSystemService(Context.TELEPHONY_SERVICE) as? android.telephony.TelephonyManager
+        tm == null || !tm.isVoiceCapable
+    } catch (_: Exception) { true }
+
     init {
         // Ensure STREAM_MUSIC is completely unmuted and restored if previously silenced
         try {
@@ -1835,32 +1944,59 @@ class AndroidSpeechInterface(
     private fun muteSpeechEarcons() {
         if (isMuted) return
         try {
+            val musicVolBefore = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC)
+            val musicMutedBefore = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) audioManager.isStreamMute(AudioManager.STREAM_MUSIC) else false
+
             origSystemVolume = audioManager.getStreamVolume(AudioManager.STREAM_SYSTEM)
             origNotificationVolume = try {
                 audioManager.getStreamVolume(AudioManager.STREAM_NOTIFICATION)
             } catch (_: Exception) { null }
 
-            // Mute STREAM_SYSTEM & STREAM_NOTIFICATION to silence Google start/stop beeps (earcons).
-            // STREAM_MUSIC is deliberately UNTOUCHED so Webradio continues uninterrupted!
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                audioManager.adjustStreamVolume(AudioManager.STREAM_SYSTEM, AudioManager.ADJUST_MUTE, 0)
-                try {
-                    audioManager.adjustStreamVolume(AudioManager.STREAM_NOTIFICATION, AudioManager.ADJUST_MUTE, 0)
-                } catch (_: SecurityException) {}
-            } else {
-                @Suppress("DEPRECATION")
-                audioManager.setStreamMute(AudioManager.STREAM_SYSTEM, true)
-                @Suppress("DEPRECATION")
-                audioManager.setStreamMute(AudioManager.STREAM_NOTIFICATION, true)
+            // On tablets without telephony (e.g. Lenovo Idea Tab) Android aliases STREAM_SYSTEM
+            // to STREAM_MUSIC. Muting SYSTEM there silently mutes ALL media (Webradio!).
+            // Only touch STREAM_SYSTEM if it is a separate stream on this device.
+            if (!systemAliasedToMusic) {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                    audioManager.adjustStreamVolume(AudioManager.STREAM_SYSTEM, AudioManager.ADJUST_MUTE, 0)
+                } else {
+                    @Suppress("DEPRECATION")
+                    audioManager.setStreamMute(AudioManager.STREAM_SYSTEM, true)
+                }
+
+                // Safety check: did muting SYSTEM also hit MUSIC?
+                val musicVolAfter = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC)
+                val musicMutedAfter = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) audioManager.isStreamMute(AudioManager.STREAM_MUSIC) else false
+                if (musicVolAfter != musicVolBefore || (musicMutedAfter && !musicMutedBefore)) {
+                    Log.w("AndroidSpeechInterface", "STREAM_SYSTEM is aliased to STREAM_MUSIC on this device -> not muting system stream")
+                    systemAliasedToMusic = true
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                        audioManager.adjustStreamVolume(AudioManager.STREAM_SYSTEM, AudioManager.ADJUST_UNMUTE, 0)
+                        audioManager.adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_UNMUTE, 0)
+                    } else {
+                        @Suppress("DEPRECATION")
+                        audioManager.setStreamMute(AudioManager.STREAM_SYSTEM, false)
+                    }
+                    try { audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, musicVolBefore, 0) } catch (_: Exception) {}
+                    origSystemVolume = null
+                }
             }
 
-            // Fallback for devices where ADJUST_MUTE doesn't silence system earcons completely
             try {
-                audioManager.setStreamVolume(AudioManager.STREAM_SYSTEM, 0, 0)
-            } catch (_: Exception) {}
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                    audioManager.adjustStreamVolume(AudioManager.STREAM_NOTIFICATION, AudioManager.ADJUST_MUTE, 0)
+                } else {
+                    @Suppress("DEPRECATION")
+                    audioManager.setStreamMute(AudioManager.STREAM_NOTIFICATION, true)
+                }
+            } catch (_: SecurityException) {}
+
+            // Final guard: media must stay audible no matter what
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && audioManager.isStreamMute(AudioManager.STREAM_MUSIC) && !musicMutedBefore) {
+                audioManager.adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_UNMUTE, 0)
+            }
 
             isMuted = true
-            Log.d("AndroidSpeechInterface", "Speech earcons muted (system: 0, music untouched)")
+            Log.d("AndroidSpeechInterface", "Speech earcons muted (systemAliasedToMusic=$systemAliasedToMusic)")
         } catch (e: Exception) {
             Log.w("AndroidSpeechInterface", "Error muting speech earcon streams", e)
         }
@@ -1882,7 +2018,7 @@ class AndroidSpeechInterface(
                 audioManager.setStreamMute(AudioManager.STREAM_NOTIFICATION, false)
             }
 
-            origSystemVolume?.let { vol ->
+            if (!systemAliasedToMusic) origSystemVolume?.let { vol ->
                 try {
                     audioManager.setStreamVolume(AudioManager.STREAM_SYSTEM, vol, 0)
                 } catch (_: Exception) {}
