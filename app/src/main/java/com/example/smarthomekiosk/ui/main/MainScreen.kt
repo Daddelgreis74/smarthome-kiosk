@@ -19,6 +19,7 @@ import android.speech.RecognizerIntent
 import android.speech.SpeechRecognizer
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
+import android.media.AudioManager
 import android.media.MediaPlayer
 import android.util.Base64
 import android.util.Log
@@ -1626,9 +1627,14 @@ class AndroidSpeechInterface(
     private val context: Context,
     private val webViewProvider: () -> WebView?
 ) {
+    private val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
     private var speechRecognizer: SpeechRecognizer? = null
     private var textToSpeech: TextToSpeech? = null
     private var isTtsReady = false
+
+    private var isMuted = false
+    private var origSystemVolume: Int? = null
+    private var origNotificationVolume: Int? = null
 
     init {
         (context as? Activity)?.runOnUiThread {
@@ -1658,63 +1664,176 @@ class AndroidSpeechInterface(
         }
     }
 
+    @Synchronized
+    private fun muteSpeechEarcons() {
+        if (isMuted) return
+        try {
+            origSystemVolume = audioManager.getStreamVolume(AudioManager.STREAM_SYSTEM)
+            origNotificationVolume = try {
+                audioManager.getStreamVolume(AudioManager.STREAM_NOTIFICATION)
+            } catch (_: Exception) { null }
+
+            // Mute STREAM_SYSTEM & STREAM_NOTIFICATION to silence Google start/stop beeps (earcons).
+            // STREAM_MUSIC (Dashboard media / radio) remains untouched!
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                audioManager.adjustStreamVolume(AudioManager.STREAM_SYSTEM, AudioManager.ADJUST_MUTE, 0)
+                try {
+                    audioManager.adjustStreamVolume(AudioManager.STREAM_NOTIFICATION, AudioManager.ADJUST_MUTE, 0)
+                } catch (_: SecurityException) {}
+            } else {
+                @Suppress("DEPRECATION")
+                audioManager.setStreamMute(AudioManager.STREAM_SYSTEM, true)
+                @Suppress("DEPRECATION")
+                audioManager.setStreamMute(AudioManager.STREAM_NOTIFICATION, true)
+            }
+
+            // Fallback for devices where ADJUST_MUTE doesn't silence system earcons completely
+            try {
+                audioManager.setStreamVolume(AudioManager.STREAM_SYSTEM, 0, 0)
+            } catch (_: Exception) {}
+
+            isMuted = true
+            Log.d("AndroidSpeechInterface", "Speech earcons muted (system: 0)")
+        } catch (e: Exception) {
+            Log.w("AndroidSpeechInterface", "Error muting speech earcon streams", e)
+        }
+    }
+
+    @Synchronized
+    private fun restoreSpeechEarcons() {
+        if (!isMuted) return
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                audioManager.adjustStreamVolume(AudioManager.STREAM_SYSTEM, AudioManager.ADJUST_UNMUTE, 0)
+                try {
+                    audioManager.adjustStreamVolume(AudioManager.STREAM_NOTIFICATION, AudioManager.ADJUST_UNMUTE, 0)
+                } catch (_: SecurityException) {}
+            } else {
+                @Suppress("DEPRECATION")
+                audioManager.setStreamMute(AudioManager.STREAM_SYSTEM, false)
+                @Suppress("DEPRECATION")
+                audioManager.setStreamMute(AudioManager.STREAM_NOTIFICATION, false)
+            }
+
+            origSystemVolume?.let { vol ->
+                try {
+                    audioManager.setStreamVolume(AudioManager.STREAM_SYSTEM, vol, 0)
+                } catch (_: Exception) {}
+            }
+            origNotificationVolume?.let { vol ->
+                try {
+                    audioManager.setStreamVolume(AudioManager.STREAM_NOTIFICATION, vol, 0)
+                } catch (_: Exception) {}
+            }
+            Log.d("AndroidSpeechInterface", "Speech earcons restored")
+        } catch (e: Exception) {
+            Log.w("AndroidSpeechInterface", "Error restoring speech earcon streams", e)
+        } finally {
+            isMuted = false
+            origSystemVolume = null
+            origNotificationVolume = null
+        }
+    }
+
+    private fun getOrCreateSpeechRecognizer(): SpeechRecognizer {
+        speechRecognizer?.let { return it }
+
+        val recognizer = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && SpeechRecognizer.isOnDeviceRecognitionAvailable(context)) {
+            Log.i("AndroidSpeechInterface", "Using OnDeviceSpeechRecognizer (zero latency, offline)")
+            SpeechRecognizer.createOnDeviceSpeechRecognizer(context)
+        } else {
+            Log.i("AndroidSpeechInterface", "Using standard SpeechRecognizer")
+            SpeechRecognizer.createSpeechRecognizer(context)
+        }
+        speechRecognizer = recognizer
+        setupRecognitionListener(recognizer)
+        return recognizer
+    }
+
+    private fun setupRecognitionListener(recognizer: SpeechRecognizer) {
+        recognizer.setRecognitionListener(object : RecognitionListener {
+            override fun onReadyForSpeech(params: Bundle?) {
+                (context as? Activity)?.runOnUiThread {
+                    webViewProvider()?.evaluateJavascript("if(window._onNativeSpeechStart) window._onNativeSpeechStart();", null)
+                }
+            }
+            override fun onBeginningOfSpeech() {}
+            override fun onRmsChanged(rmsdB: Float) {}
+            override fun onBufferReceived(buffer: ByteArray?) {}
+            override fun onEndOfSpeech() {}
+            override fun onError(error: Int) {
+                val errorMsg = when (error) {
+                    SpeechRecognizer.ERROR_AUDIO -> "audio"
+                    SpeechRecognizer.ERROR_CLIENT -> "client"
+                    SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> "not-allowed"
+                    SpeechRecognizer.ERROR_NETWORK -> "network"
+                    SpeechRecognizer.ERROR_NETWORK_TIMEOUT -> "network"
+                    SpeechRecognizer.ERROR_NO_MATCH -> "no-speech"
+                    SpeechRecognizer.ERROR_RECOGNIZER_BUSY -> "busy"
+                    SpeechRecognizer.ERROR_SERVER -> "network"
+                    SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> "no-speech"
+                    else -> "aborted"
+                }
+
+                // If recognizer is busy or failed critically, reset it so next cycle starts cleanly
+                if (error == SpeechRecognizer.ERROR_RECOGNIZER_BUSY || error == SpeechRecognizer.ERROR_CLIENT) {
+                    try {
+                        speechRecognizer?.cancel()
+                        speechRecognizer?.destroy()
+                        speechRecognizer = null
+                    } catch (_: Exception) {}
+                }
+
+                (context as? Activity)?.runOnUiThread {
+                    webViewProvider()?.evaluateJavascript("if(window._onNativeSpeechError) window._onNativeSpeechError('$errorMsg');", null)
+                    webViewProvider()?.evaluateJavascript("if(window._onNativeSpeechEnd) window._onNativeSpeechEnd();", null)
+                }
+            }
+            override fun onResults(results: Bundle?) {
+                val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                (context as? Activity)?.runOnUiThread {
+                    if (!matches.isNullOrEmpty()) {
+                        val text = matches[0].replace("\\", "\\\\").replace("'", "\\'")
+                        webViewProvider()?.evaluateJavascript("if(window._onNativeSpeechResult) window._onNativeSpeechResult('$text', true);", null)
+                    }
+                    webViewProvider()?.evaluateJavascript("if(window._onNativeSpeechEnd) window._onNativeSpeechEnd();", null)
+                }
+            }
+            override fun onPartialResults(partialResults: Bundle?) {
+                val matches = partialResults?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                if (!matches.isNullOrEmpty()) {
+                    val text = matches[0].replace("\\", "\\\\").replace("'", "\\'")
+                    (context as? Activity)?.runOnUiThread {
+                        webViewProvider()?.evaluateJavascript("if(window._onNativeSpeechResult) window._onNativeSpeechResult('$text', false);", null)
+                    }
+                }
+            }
+            override fun onEvent(eventType: Int, params: Bundle?) {}
+        })
+    }
+
     @JavascriptInterface
     fun startListening(lang: String) {
         (context as? Activity)?.runOnUiThread {
             try {
-                if (speechRecognizer == null) {
-                    speechRecognizer = SpeechRecognizer.createSpeechRecognizer(context)
-                }
+                muteSpeechEarcons()
 
-                speechRecognizer?.setRecognitionListener(object : RecognitionListener {
-                    override fun onReadyForSpeech(params: Bundle?) {
-                        webViewProvider()?.evaluateJavascript("if(window._onNativeSpeechStart) window._onNativeSpeechStart();", null)
-                    }
-                    override fun onBeginningOfSpeech() {}
-                    override fun onRmsChanged(rmsdB: Float) {}
-                    override fun onBufferReceived(buffer: ByteArray?) {}
-                    override fun onEndOfSpeech() {}
-                    override fun onError(error: Int) {
-                        val errorMsg = when (error) {
-                            SpeechRecognizer.ERROR_AUDIO -> "audio"
-                            SpeechRecognizer.ERROR_CLIENT -> "client"
-                            SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> "not-allowed"
-                            SpeechRecognizer.ERROR_NETWORK -> "network"
-                            SpeechRecognizer.ERROR_NETWORK_TIMEOUT -> "network"
-                            SpeechRecognizer.ERROR_NO_MATCH -> "no-speech"
-                            SpeechRecognizer.ERROR_RECOGNIZER_BUSY -> "busy"
-                            SpeechRecognizer.ERROR_SERVER -> "network"
-                            SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> "no-speech"
-                            else -> "aborted"
-                        }
-                        webViewProvider()?.evaluateJavascript("if(window._onNativeSpeechError) window._onNativeSpeechError('$errorMsg');", null)
-                    }
-                    override fun onResults(results: Bundle?) {
-                        val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-                        if (!matches.isNullOrEmpty()) {
-                            val text = matches[0].replace("'", "\\'")
-                            webViewProvider()?.evaluateJavascript("if(window._onNativeSpeechResult) window._onNativeSpeechResult('$text', true);", null)
-                        }
-                        webViewProvider()?.evaluateJavascript("if(window._onNativeSpeechEnd) window._onNativeSpeechEnd();", null)
-                    }
-                    override fun onPartialResults(partialResults: Bundle?) {
-                        val matches = partialResults?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-                        if (!matches.isNullOrEmpty()) {
-                            val text = matches[0].replace("'", "\\'")
-                            webViewProvider()?.evaluateJavascript("if(window._onNativeSpeechResult) window._onNativeSpeechResult('$text', false);", null)
-                        }
-                    }
-                    override fun onEvent(eventType: Int, params: Bundle?) {}
-                })
+                val recognizer = getOrCreateSpeechRecognizer()
 
                 val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
                     putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
                     putExtra(RecognizerIntent.EXTRA_LANGUAGE, if (lang.isNotEmpty()) lang else "de-DE")
                     putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
+                    putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, true)
+                    putExtra("android.speech.extra.DICTATION_MODE", true)
                 }
-                speechRecognizer?.startListening(intent)
+                recognizer.startListening(intent)
             } catch (e: Exception) {
                 Log.e("AndroidSpeechInterface", "Error starting speech recognition", e)
+                try {
+                    speechRecognizer?.destroy()
+                    speechRecognizer = null
+                } catch (_: Exception) {}
             }
         }
     }
@@ -1724,6 +1843,7 @@ class AndroidSpeechInterface(
         (context as? Activity)?.runOnUiThread {
             try {
                 speechRecognizer?.stopListening()
+                restoreSpeechEarcons()
             } catch (e: Exception) {
                 Log.e("AndroidSpeechInterface", "Error stopping speech recognition", e)
             }

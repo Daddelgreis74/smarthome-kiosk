@@ -11,8 +11,8 @@ android {
         applicationId = "com.example.smarthomekiosk"
         minSdk = 24
         targetSdk = 36
-        versionCode = 15
-        versionName = "3.5"
+        versionCode = 16
+        versionName = "3.6"
     }
 
     signingConfigs {
